@@ -53,6 +53,7 @@ const CH = { mag:'#FF2E88', yel:'#FFE14A', grn:'#19E3A0', ora:'#FF7A1A', cya:'#2
 /* ---------- utilidades ---------- */
 function rectsOverlap(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+const WALL = 46;   // margen contra la pared: el sprite (poncho, pollera, brazos) nunca se corta en el borde
 function lerp(a,b,k){ return a+(b-a)*k; }
 function easeOut(k){ k=clamp(k,0,1); return 1-(1-k)*(1-k)*(1-k); }
 function easeInOut(k){ k=clamp(k,0,1); return k<.5 ? 4*k*k*k : 1-Math.pow(-2*k+2,3)/2; }
@@ -335,16 +336,21 @@ const NUM = ['cero','uno','dos','tres','cuatro','cinco'];
 const keys = {};
 addEventListener('keydown', e=>{
   if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Tab'].includes(e.code)) e.preventDefault();
-  if(!e.repeat) Game.keyPressed(e.code);
+  if(!e.repeat){ pressedAt[e.code] = Game.t; Game.keyPressed(e.code); }
   keys[e.code] = true;
 });
 addEventListener('keyup', e=>{ keys[e.code] = false; });
-addEventListener('blur', ()=>{ for(const k in keys) keys[k]=false; });
-const consumed = {};
-function consume(code){
-  if(keys[code] && !consumed[code]){ consumed[code]=true; return true; }
-  if(!keys[code]) consumed[code]=false;
-  return false;
+addEventListener('blur', ()=>{ for(const k in keys){ keys[k]=false; delete pressedAt[k]; } });
+/* búfer de entrada: una pulsación vale durante INPUT_BUF cuadros, así un toque rápido
+   no se pierde durante el hit-stop, un destello de súper o el final de otro ataque */
+const INPUT_BUF = 8;
+const pressedAt = {};
+function consume(code, peek){
+  const t = pressedAt[code];
+  if(t === undefined) return false;
+  if(Game.t - t > INPUT_BUF){ delete pressedAt[code]; return false; }
+  if(!peek) delete pressedAt[code];
+  return true;
 }
 function keysDown(controls, name){ return keys[controls[name]]; }
 
@@ -575,7 +581,10 @@ class Fighter {
     return {x: this.facing===1 ? this.x + this.w/2 - 6 : this.x - this.w/2 - range + 6,
             y: this.y - yOff - hh/2, w: range, h: hh, dmg:atk.dmg, push:atk.push, kind:this.state};
   }
-  setState(s){ this.state = s; this.stateT = 0; this.hitDone = false; this.finalHits = 0; }
+  setState(s){
+    if(this.state==='final' && s!=='final'){ this.hidden = false; this.sd = null; }
+    this.state = s; this.stateT = 0; this.hitDone = false; this.finalHits = 0;
+  }
   update(opp, game){
     this.stateT++;
     if(this.flash>0) this.flash--;
@@ -583,7 +592,7 @@ class Fighter {
     const busy = ['punch','kick','special','final','hit','ko'].includes(this.state);
     if(!busy) this.facing = (opp.x >= this.x) ? 1 : -1;
 
-    let inp = this.isCPU ? this.ai(opp, game) : this.readInput();
+    let inp = this.isCPU ? this.ai(opp, game) : this.readInput(busy);
 
     if(this.state==='ko'){ this.physics(); this.tickVisual(); return; }
     if(this.state==='hit'){
@@ -592,8 +601,11 @@ class Fighter {
     }
 
     if(!busy){
-      if(inp.special && this.meter >= 34){ this.doSpecial(game); }
-      else if(inp.final && this.meter >= 100){ this.doFinal(game); }
+      // nadie lanza especiales ni finales cuando el round ya se decidió, ni un final sobre otro final
+      const roundLive = opp.state!=='ko' && this.state!=='ko';
+      const finalFree = roundLive && opp.state!=='final' && !game.cine;
+      if(inp.special && this.meter >= 34 && roundLive && opp.state!=='final'){ this.doSpecial(game); }
+      else if(inp.final && this.meter >= 100 && finalFree){ this.doFinal(game); }
       else if(inp.punch){ this.setState('punch'); sfx.whoosh(1); }
       else if(inp.kick){ this.setState('kick'); sfx.whoosh(0.7); }
       else if(inp.jump && this.onGround){ this.vy = this.c.jump; this.setState('jump'); sfx.jump(); game.dust(this.x, 5, 0.8); }
@@ -611,14 +623,14 @@ class Fighter {
         else this.vx = 0;
       } else if(this.state!=='kick') this.vx = 0;
       const dur = this.attackDuration();
-      if(this.stateT > dur){ if(this.state==='final'){ this.hidden=false; this.sd=null; } this.setState('idle'); }
+      if(this.stateT > dur) this.setState('idle');
     }
     if(this.state==='block' || this.state==='crouch'){
       const stillHolding = this.isCPU ? this.aiHold : (keysDown(this.controls,'down') || keysDown(this.controls, this.facing===1?'left':'right'));
       if(!stillHolding) this.setState('idle');
     }
     this.physics();
-    this.x = clamp(this.x, 30, W-30);
+    this.x = clamp(this.x, WALL, W-WALL);
     if(this.state==='walk'){
       const dir = Math.sign(this.vx)*this.facing;
       this.walkPh += Math.abs(this.vx)*0.075*(dir>=0?1:-1);
@@ -636,22 +648,29 @@ class Fighter {
   physics(){
     this.x += this.vx;
     this.y += this.vy;
+    this.x = clamp(this.x, WALL, W-WALL);
+    if(this.state==='ko'){
+      if(this.onGround) this.vx *= 0.86;   // el K.O. se desliza y se detiene
+      // tumbado, rodillas y brazos sobresalen ~95 px hacia adelante: no dejar que pisen el borde
+      const kx = clamp(this.x, 145, W-145);
+      this.x += (kx - this.x)*0.3;
+    }
     if(!this.onGround || this.vy<0){ this.vy += this.c.weight; }
     if(this.y > GROUND){ this.y = GROUND; this.vy = 0; if(this.state==='jump') this.setState('idle'); }
   }
-  readInput(){
+  readInput(peek){
     const c = this.controls;
     return {
       left: keys[c.left], right: keys[c.right], jump: keys[c.up], down: keys[c.down],
       back: this.facing===1 ? keys[c.left] : keys[c.right],
-      punch: consume(c.punch), kick: consume(c.kick),
-      special: consume(c.special), final: consume(c.final),
+      punch: consume(c.punch, peek), kick: consume(c.kick, peek),
+      special: consume(c.special, peek), final: consume(c.final, peek),
     };
   }
   doSpecial(game){
     this.meter -= 34; this.setState('special');
     sfx.special();
-    if(this.c.special.type==='proj'){ game.spawnProjectileAt = {owner:this, t:10}; }
+    if(this.c.special.type==='proj'){ game.spawnProjectileAt.push({owner:this, t:10}); }
     game.superFlash = {who:this, t:12};
     game.callout(this.x, this.y-this.h-16, this.c.special.callout, this.c.special.aura, 1.2);
   }
@@ -675,6 +694,7 @@ class Fighter {
       if(this.combo>=2) game.comboShow = {who:this, n:this.combo, t:70};
     }
     this.hp = Math.max(0, this.hp);
+    this.x = clamp(this.x, WALL, W-WALL);
   }
   ai(opp, game){
     this.aiT--;
@@ -1955,7 +1975,7 @@ function palm(x, gy, dir){
 function approach(a, d, dist, spd){
   const dx = d.x - a.x, ad = Math.abs(dx);
   if(ad > dist) a.x += Math.sign(dx)*Math.min(spd, ad-dist);
-  a.x = clamp(a.x, 30, W-30);
+  a.x = clamp(a.x, WALL, W-WALL);
 }
 function lp2(a, b, k){ return [a[0]+(b[0]-a[0])*k, a[1]+(b[1]-a[1])*k]; }
 function prand(seed){ const x = Math.sin(seed*127.1)*43758.5453; return x - Math.floor(x); }
@@ -2333,7 +2353,7 @@ const SUPERS = {
     update(g,a,d,t,sd){
       if(t<=14) approach(a,d,58,11);
       if([20,25,30,35,40,45].includes(t)) g.superHit(a,d,2,false,d.x-a.facing*18,d.y-d.h*(0.45+rnd(0,0.3)),{word: t===30||t===45 ? '¡DRAGÓN!' : null});
-      if(t>50 && t<64){ a.x -= a.facing*9; a.x=clamp(a.x,30,W-30); }
+      if(t>50 && t<64){ a.x -= a.facing*9; a.x=clamp(a.x,WALL,W-WALL); }
       if(t===58){ sfx.gong(); g.flash={col:'#FFD24D',a:0.35}; }
       if(t>=56 && t<=134){
         const cx=d.x, cy=d.y-d.h*0.55;
@@ -2929,7 +2949,7 @@ const Game = {
   roundMsgT:0, roundTotal:110, koT:0, koMsg:'', koWho:null, perfect:false,
   selCursor:0, selMode:0, selPhase:0, p1Key:null, show:{},
   stageCursor:0, stageKey:'viaexpresa', pend:null,
-  spawnProjectileAt:null, winner:null,
+  spawnProjectileAt:[], winner:null,
   cam:{x:W/2, z:1.04}, flash:{col:'#fff', a:0}, cine:null, superFlash:null, comboShow:null,
   vsF:null, titleF:null,
 
@@ -3057,7 +3077,7 @@ const Game = {
     this.p2 = new Fighter(p.k2, W*0.7, -1, Object.assign({}, this.P2CTRL), p.cpu);
     this.p2altBind();
     if(p.lvl!==undefined){ this.p2.aiLv = p.lvl; if(this.p2.boss) this.p2.meter = 50; }
-    this.wins=[0,0]; this.round=1; this.parts=[]; this.callouts=[];
+    this.wins=[0,0]; this.round=1; this.parts=[]; this.callouts=[]; this.spawnProjectileAt=[]; this.freeze=0; this.cine=null; this.superFlash=null;
     this.cam = {x:W/2, z:1.3};
     this.newRound();
     this.setScene('fight'); this.paused=false;
@@ -3065,12 +3085,11 @@ const Game = {
   },
   p2altBind(){
     const alt=this.P2ALT, orig = this.p2.readInput.bind(this.p2);
-    this.p2.readInput = ()=>{
-      const inp = orig();
-      inp.punch = inp.punch || consume(alt.punch);
-      inp.kick = inp.kick || consume(alt.kick);
-      inp.special = inp.special || consume(alt.special);
-      inp.final = inp.final || consume(alt.final);
+    this.p2.readInput = (peek)=>{
+      const inp = orig(peek);
+      const ap = consume(alt.punch, peek), ak = consume(alt.kick, peek), as = consume(alt.special, peek), af = consume(alt.final, peek);
+      inp.punch = inp.punch || ap; inp.kick = inp.kick || ak;
+      inp.special = inp.special || as; inp.final = inp.final || af;
       return inp;
     };
   },
@@ -3078,10 +3097,10 @@ const Game = {
     [this.p1,this.p2].forEach((f,i)=>{
       f.hp=100; f.hpLag=100; f.setState('idle'); f.combo=0;
       f.x = i===0 ? W*0.3 : W*0.7; f.y=GROUND; f.vx=0; f.vy=0; f.facing = i===0?1:-1;
-      f.trail=[]; f.ghosts=[];
+      f.trail=[]; f.ghosts=[]; f.hidden=false; f.sd=null; f.lockT=0; f.sqx=1; f.sqy=1;
       if(f.shadow){ const o = KEYS8.filter(k=>k!==f.key); f.morph(o[Math.floor(Math.random()*o.length)]); }
     });
-    this.proj=[]; this.decals=[]; this.timer=99; this.timerAcc=0;
+    this.proj=[]; this.decals=[]; this.spawnProjectileAt=[]; this.freeze=0; this.timer=99; this.timerAcc=0;
     this.roundTotal = this.round===1 ? 175 : 110; this.roundMsgT = this.roundTotal;
     this.cine=null; this.superFlash=null; this.koT=0; this.koWho=null; this.slowmo=0; this.comboShow=null;
     const finalR = this.wins[0]===1 && this.wins[1]===1;
@@ -3120,7 +3139,7 @@ const Game = {
   callout(x,y,text,col,sc=1){ this.callouts.push({x:clamp(x,80,W-80), y, text, col, life:46, max:46, sc, rot:rnd(-0.12,0.12)}); },
   toScreen(x, y){ return {x: W/2 + (x-this.cam.x)*this.cam.z, y: GROUND + (y-GROUND)*this.cam.z}; },
   superHit(a, d, dmg, last, px, py, opt={}){
-    if(d.state==='ko') return false;
+    if(d.state==='ko' || d.state==='final') return false;
     const sd = a.sd || (a.sd = {});
     if(sd.blocked===undefined) sd.blocked = (d.state==='block');
     const blocked = sd.blocked;
@@ -3203,22 +3222,27 @@ const Game = {
     }
 
     const koActive = this.p1.state==='ko'||this.p2.state==='ko';
-    if(!koActive){
+    const finalOn = this.p1.state==='final' || this.p2.state==='final';
+    if(!koActive && !finalOn){
       this.timerAcc++;
-      if(this.timerAcc>=60){ this.timerAcc=0; this.timer=Math.max(0,this.timer-1); if(this.timer===0) this.timeOver(); }
+      if(this.timerAcc>=60){ this.timerAcc=0; this.timer=Math.max(0,this.timer-1); }
+      if(this.timer===0) this.timeOver();
     }
 
     this.p1.update(this.p2,this);
     this.p2.update(this.p1,this);
     this.pushApart();
 
-    if(this.spawnProjectileAt){
-      this.spawnProjectileAt.t--;
-      if(this.spawnProjectileAt.t<=0){ this.proj.push(new Projectile(this.spawnProjectileAt.owner)); this.spawnProjectileAt=null; }
-    }
+    // el proyectil sale a los 10 cuadros del especial; si el lanzador fue golpeado antes, se cancela
+    this.spawnProjectileAt = this.spawnProjectileAt.filter(sp=>{
+      if(sp.owner.state!=='special') return false;
+      if(--sp.t > 0) return true;
+      this.proj.push(new Projectile(sp.owner)); return false;
+    });
 
-    this.resolveMelee(this.p1,this.p2);
-    this.resolveMelee(this.p2,this.p1);
+    const box1 = this.p1.attackBox(), box2 = this.p2.attackBox();
+    this.resolveMelee(this.p1,this.p2,box1);
+    this.resolveMelee(this.p2,this.p1,box2);
 
     // la Sombra cambia de forma cada cierto tiempo
     [this.p1,this.p2].forEach(f=>{
@@ -3305,11 +3329,18 @@ const Game = {
     const a=this.p1.hurtbox(), b=this.p2.hurtbox();
     if(rectsOverlap(a,b)){
       const overlap = (a.w+b.w)/2 - Math.abs(this.p1.x-this.p2.x);
-      if(overlap>0){ const dir = this.p1.x<this.p2.x?1:-1; this.p1.x -= dir*overlap/2; this.p2.x += dir*overlap/2; }
+      if(overlap>0){
+        const dir = this.p1.x<this.p2.x?1:-1;
+        this.p1.x -= dir*overlap/2; this.p2.x += dir*overlap/2;
+        // si uno queda contra la pared, el empuje que le sobra lo absorbe el otro
+        for(const [f,o] of [[this.p1,this.p2],[this.p2,this.p1]]){
+          const cx = clamp(f.x, WALL, W-WALL);
+          if(cx!==f.x){ o.x -= (f.x-cx); f.x = cx; o.x = clamp(o.x, WALL, W-WALL); }
+        }
+      }
     }
   },
-  resolveMelee(att,def){
-    const box = att.attackBox();
+  resolveMelee(att,def,box){
     if(box && !att.hitDone && def.state!=='ko' && def.state!=='final' && rectsOverlap(box, def.hurtbox())){
       att.hitDone = true;
       const blocked = def.state==='block';
@@ -3325,7 +3356,12 @@ const Game = {
     }
   },
   ko(winner,loser){
-    loser.setState('ko'); loser.vx = winner.facing*3.5; loser.vy = -7;
+    loser.setState('ko'); loser.vy = -7;
+    // el K.O. cae de espaldas (~190 px de cuerpo tumbado) y se desliza ~95 px: si la pared de atrás
+    // no deja espacio, cae hacia el lado del centro para que cabeza y piernas no se salgan de la pantalla
+    let back = -loser.facing;
+    if(back<0 ? loser.x < 190+95 : loser.x > W-190-95){ loser.facing = -loser.facing; back = -back; }
+    loser.vx = back*3.5;
     sfx.ko(); this.trauma = 1; this.slowmo = REDUCED ? 0 : 42; this.koWho = loser;
     this.flash = {col:'#FFFFFF', a:REDUCED?0.3:0.75}; this.hype = 1;
     this.perfect = winner.hp>=100;
